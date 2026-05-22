@@ -81,7 +81,7 @@ where = ["src"]
 exclude = ["docs", "tests"]
 
 [tool.setuptools.package-data]
-tetra = ["templates/*", "js/*", "static/*", "scripts/*.sh"]
+tetra = ["templates/*", "js/*", "static/*", "scripts/*.sh", "**/*.html", "**/*.js", "**/*.css"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
