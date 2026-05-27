@@ -15,7 +15,7 @@
 {% for lib in libs %}
 <script defer src="{{ lib.js_url }}"></script>
 {% endfor %}
-<script defer src="{% static 'tetra/js/tetra.js' %}"></script>
+<script defer type="module" src="{% static 'tetra/js/tetra.js' %}"></script>
 {% if include_alpine %}
   {% if debug|yesno:"true,false" %}
     <script defer src="{% static 'tetra/js/alpinejs.morph.cdn.js' %}"></script>
