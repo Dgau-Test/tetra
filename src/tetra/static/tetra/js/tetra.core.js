@@ -1,0 +1,2061 @@
+
+const Tetra = {
+  ws: null,
+  pendingSubscriptions: new Map(), // Store subscriptions until WS is ready
+  offlineCallQueue: [], // Queue for method calls made while offline
+  queueRetryTimer: null, // Timer for periodic queue retry attempts
+
+  debug(...args) {
+    // Only output debug messages when DEBUG is enabled
+    if (window.__tetra_debug) {
+      console.debug(...args);
+    }
+  },
+
+  init() {
+    Alpine.magic('static', () => Tetra.$static);
+    // Initialize WebSocket connection immediately, if in use
+    if(window.__tetra_useWebsockets) {
+      this.ensureWebSocketConnection();
+    }
+    // Handle initial messages passed from the server
+    if (window.__tetra_messages) {
+      this.handleInitialMessages(window.__tetra_messages);
+      delete window.__tetra_messages;
+    }
+
+    // Initialize global subscription store
+    if (!Alpine.store('tetra_subscriptions')) {
+      Alpine.store('tetra_subscriptions', {});
+    }
+
+    // Initialize online status store
+    this.initOnlineStatusStore();
+
+    // Listen for browser online/offline events
+    this.initBrowserOnlineDetection();
+
+    // listen for URL changes
+    this.initRouteStore()
+  },
+  initRouteStore() {
+    Alpine.store('route', {
+      path: window.location.pathname,
+      go(path) {
+        history.pushState({}, '', path)
+        this.path = path
+      }
+    })
+    window.addEventListener('popstate', () => {
+      Alpine.store('route').path = window.location.pathname
+    })
+  },
+  navigate(path) {
+    // Shortcut for client side navigation
+    Alpine.store('route').go(path)
+
+    // Notify server about the navigation
+    this.notifyNavigation(path)
+  },
+  notifyNavigation(path) {
+    // Notify the Django server about client-side navigation
+    // This keeps request.tetra.current_url_path in sync with browser URL
+
+    const payload = {
+      protocol: 'tetra-1.0',
+      type: 'navigation',
+      payload: {
+        path: path
+      }
+    }
+    if (window.__tetra_useWebsockets && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      // Use WebSocket if available (fast, real-time)
+      this.sendWebSocketMessage(payload)
+    } else {
+      // Fallback to HTTP POST (fire-and-forget with CSRF protection)
+      const endpoint = window.__tetra_endpoint
+      if (!endpoint){
+        console.error('Tetra endpoint is missing')
+        return
+      }
+
+      fetch(endpoint + 'navigate/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRFToken': window.__tetra_csrfToken,
+        },
+        body: JSON.stringify(payload),
+        keepalive: true, // Request continues even if page unloads
+      }).catch(() => {
+        // Silently fail - this is just a notification
+      })
+    }
+  },
+  initOnlineStatusStore() {
+    if (this.onlineStatusInitialized) return;
+    this.onlineStatusInitialized = true;
+
+    if (typeof Alpine !== 'undefined') {
+      if (!Alpine.store('tetraStatus')) {
+        Alpine.store('tetraStatus', {
+          online: true,
+          lastActivity: Date.now(),
+          update() {
+            this.online = true;
+            this.lastActivity = Date.now();
+          }
+        });
+      }
+    }
+
+    const defaultTimeout = window.__tetra_onlineTimeout || 10000;
+    if (this.offlineTimeout) {
+      clearTimeout(this.offlineTimeout);
+    }
+    this.offlineTimeout = setTimeout(() => this.checkOnlineStatus(), defaultTimeout);
+
+    // Also update on manual reconnect
+    document.addEventListener('tetra:websocket-connected', () => this.updateOnlineStatus());
+  },
+  updateOnlineStatus() {
+    if (typeof Alpine !== 'undefined') {
+      const store = Alpine.store('tetraStatus');
+      if (store) {
+        store.update();
+      }
+    }
+
+    if (this.offlineTimeout) {
+      clearTimeout(this.offlineTimeout);
+    }
+    const timeout = window.__tetra_onlineTimeout || 10000;
+    this.offlineTimeout = setTimeout(() => this.checkOnlineStatus(), timeout);
+
+    if (this.pingTimeout) {
+      clearTimeout(this.pingTimeout);
+    }
+  },
+  checkOnlineStatus() {
+    if (this.pingTimeout) {
+      clearTimeout(this.pingTimeout);
+    }
+    // If we haven't had activity, try to ping the server
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        protocol: "tetra-1.0",
+        type: "ping"
+      }));
+      // Set another timeout to check if we got a response
+      const timeout = window.__tetra_pingTimeout || 5000;
+      this.pingTimeout = setTimeout(() => this.setOfflineStatus(), timeout);
+    } else {
+      this.setOfflineStatus();
+    }
+  },
+  setOfflineStatus() {
+    if (typeof Alpine !== 'undefined') {
+      const store = Alpine.store('tetraStatus');
+      if (store && store.online !== false) {
+        store.online = false;
+        document.dispatchEvent(new CustomEvent('tetra:websocket-disconnected'));
+      }
+    }
+  },
+
+  initBrowserOnlineDetection() {
+    // Listen for browser's online/offline events
+    // These fire when DevTools switches offline mode or actual network changes
+    if (this.browserOnlineDetectionInitialized) return;
+    this.browserOnlineDetectionInitialized = true;
+
+    window.addEventListener('online', () => {
+      Tetra.debug('Browser detected network online');
+      this.updateOnlineStatus();
+
+      // Try to reconnect WebSocket if it's not connected
+      if (window.__tetra_useWebsockets) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          this.ensureWebSocketConnection();
+        }
+      }
+
+      // Process offline queue when we come back online
+      if (this.offlineCallQueue.length > 0) {
+        Tetra.debug(`Browser online event: processing ${this.offlineCallQueue.length} queued calls`);
+        // Small delay to ensure connection is stable
+        setTimeout(() => {
+          this.processOfflineCallQueue();
+        }, 500);
+      }
+    });
+
+    window.addEventListener('offline', () => {
+      Tetra.debug('Browser detected network offline');
+      this.setOfflineStatus();
+    });
+  },
+
+  handleInitialMessages(messages) {
+    // We need to wait for Alpine components to be ready before dispatching events to them.
+    // However, since we use 'defer' for tetra.js and Alpine, they should be ready around the same time.
+    // To be safe, we can use Alpine.nextTick or a small timeout if needed, but 
+    // usually dispatching on document should work if components listen there.
+    messages.forEach((message) => {
+      document.dispatchEvent(new CustomEvent('tetra:new-message', {
+        detail: message,
+        bubbles: true
+      }));
+    });
+  },
+  $static() {
+    return (path) => {
+      return window.__tetra_staticRoot + path;
+    }
+  },
+  // Add WebSocket management methods
+  ensureWebSocketConnection() {
+    if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+      console.log("Connecting to Tetra WebSocket...");
+      const ws_scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws_url = `${ws_scheme}://${window.location.host}/ws/tetra/`;
+      this.ws = new WebSocket(ws_url);
+
+      // Suppress connection error messages in console by handling errors silently
+      this.ws.onerror = () => {
+        // Silently handle WebSocket errors to prevent console spam
+        // The onclose handler will manage reconnection logic
+      };
+
+      this.ws.onopen = () => {
+        Tetra.debug('Tetra WebSocket connected');
+        this.updateOnlineStatus();
+        document.dispatchEvent(new CustomEvent('tetra:websocket-connected'));
+        // Process any pending subscriptions
+        this.pendingSubscriptions.forEach((data, componentId) => {
+          this.ws.send(JSON.stringify(data));
+        });
+        this.pendingSubscriptions.clear();
+        // Process offline call queue
+        this.processOfflineCallQueue();
+      };
+
+      this.ws.onmessage = (event) => {
+        this.updateOnlineStatus();
+        const data = JSON.parse(event.data);
+        if (data.type === 'pong') {
+          if (this.pingTimeout) {
+            clearTimeout(this.pingTimeout);
+          }
+          return;
+        }
+        // Dispatch to all reactive components
+        // document.dispatchEvent(new CustomEvent('tetra:push-message', {detail: data}));
+        this.handleWebsocketMessage(data);
+      };
+
+      this.ws.onclose = () => {
+        console.log('Tetra WebSocket disconnected');
+        this.setOfflineStatus();
+        // Attempt to reconnect after 3 seconds
+        setTimeout(() => {
+          this.ensureWebSocketConnection();
+        }, 3000);
+      };
+    }
+    return this.ws;
+  },
+  _get_component_by_id(component_id) {
+    // Find the component by ID and return it
+    const componentEl = document.querySelector(`[tetra-component-id="${component_id}"]`);
+    if (!componentEl) {
+      // silently return undefined if no component with that id was found.
+      return;
+    }
+    return Alpine.$data(componentEl);
+  },
+  _get_components_by_subscribe_group(group) {
+    // Find all components by subscribe topic and return them
+    const store = Alpine.store('tetra_subscriptions');
+    const componentIds = store[group] || [];
+    // Ensure we return a unique list of component data objects that actually exist in DOM
+    const components = componentIds.map(id => this._get_component_by_id(id))
+        .filter(c => !!c && typeof c._removeComponent === 'function');
+    return [...new Set(components)];
+  },
+  handleWebsocketMessage(data) {
+    // This function centrally handles incoming websocket data and dispatches it to the
+    // corresponding methods, if necessary.
+
+    let messageType;
+    let payload;
+    let metadata = {};
+
+    if (data.protocol !== "tetra-1.0") {
+      console.warn('Invalid or missing Tetra protocol in WebSocket message:', data);
+      return;
+    }
+
+    messageType = data.type;
+    payload = data.payload;
+    metadata = data.metadata || {};
+
+    switch (messageType) {
+      case 'subscription.response':
+        this.handleSubscriptionResponse(payload);
+        break;
+
+      case 'notify':
+        this.handleGroupNotify(payload);
+        break;
+
+      case 'component.data_changed':
+        this.handleComponentDataChanged(payload);
+        break;
+
+      case 'component.removed':
+        this.handleComponentRemoved(payload);
+        break;
+
+      case 'component.created':
+        this.handleComponentCreated(payload);
+        break;
+
+      default:
+        console.warn('Unknown WebSocket message type:', messageType, ":", data);
+    }
+  },
+  handleSubscriptionResponse(event){
+    switch(event["status"]) {
+      case "subscribed":
+        Tetra.debug("Subscription to group", event["group"], "successful.")
+        document.dispatchEvent(new CustomEvent(`tetra:component-subscribed`,  {
+          detail: {
+            component: this,
+            group: event["group"]
+          },
+        }))
+        break;
+      case "unsubscribed":
+        Tetra.debug("Subscription to group", event["group"], "redacted successfully.")
+        document.dispatchEvent(new CustomEvent(`tetra:component-unsubscribed`,  {
+          detail: {
+            component: this,
+            group: event["group"]
+          },
+        }))
+        break;
+      case "resubscribed":
+        Tetra.debug("Re-subscription to group", event["group"], "successful.")
+        document.dispatchEvent(new CustomEvent(`tetra:component-resubscribed`,  {
+          detail: {
+            component: this,
+            group: event["group"]
+          },
+        }))
+        break;
+      case "error":
+        console.error("Error subscribing component", event["component_id"], "to group", event["group"], ":", event["message"])
+        document.dispatchEvent(new CustomEvent(`tetra:component-subscription-error`,  {
+          detail: {
+            component: this,
+            group: event["group"],
+            message:event["message"]
+          },
+        }))
+        break;
+      default:
+        Tetra.debug("Subscription response faulty:", event)
+    }
+  },
+  handleGroupNotify(event) {
+    /// Dispatch a custom event that was sent from the server as notification
+    const { group, event_name, data } = event;
+
+    // Dispatch group-specific event
+    document.dispatchEvent(new CustomEvent(event_name, {
+      detail: {
+        data,
+        group,
+      }
+    }));
+  },
+  handleComponentDataChanged(event) {
+    const { group, data, sender_id, update } = event;
+    const components = this._get_components_by_subscribe_group(group);
+    if (components.length === 0) {
+      // use [tetra-subscription] selector to find elements where the group is
+      // exactly matched.
+      const els = document.querySelectorAll(`[tetra-subscription="${group}"]`);
+      els.forEach(el => {
+        const component = Alpine.$data(el);
+        if (component && !components.includes(component)) {
+          components.push(component);
+        }
+      });
+    }
+
+    // iter through components and update their data fields
+    components.forEach((component) => {
+      // Skip update if this component is currently waiting for a response
+      // from the request that triggered this server-side change.
+      if (
+          sender_id &&
+          component.__activeRequests &&
+          component.__activeRequests.has(sender_id)
+      ) {
+        return;
+      }
+      if (data && Object.keys(data).length > 0) {
+        component._updateData(data);
+      }
+      if (update || !data || Object.keys(data).length === 0) {
+        component._updateHtml().catch(err => {
+          console.error('Error updating component HTML:', err);
+        });
+      }
+    });
+  },
+  handleComponentRemoved(event) {
+    const { type, group, component_id, target_group, sender_id } = event;
+
+    if (component_id) {
+      const component = this._get_component_by_id(component_id)
+
+      if (component && component._removeComponent) {
+        if (
+            sender_id &&
+            component.__activeRequests &&
+            component.__activeRequests.has(sender_id)
+        ) {
+          return;
+        }
+        component._removeComponent();
+      }
+      return;
+    }
+
+    if (target_group) {
+      const components = this._get_components_by_subscribe_group(target_group);
+      if (components.length === 0) {
+        const els = document.querySelectorAll(`[tetra-subscription="${target_group}"]`);
+        els.forEach(el => {
+          const component = Alpine.$data(el);
+          if (component && component._removeComponent) {
+            component._removeComponent();
+          }
+        });
+      }
+      components.forEach(component => {
+        if (component && component._removeComponent) {
+          if (
+              sender_id &&
+              component.__activeRequests &&
+              component.__activeRequests.has(sender_id)
+          ) {
+            return;
+          }
+          component._removeComponent();
+        }
+      });
+      return;
+    }
+
+    // Fallback: If no component_id or target_group is provided, find all 
+    // components subscribed to the group and remove them.
+    const components = this._get_components_by_subscribe_group(group);
+    if (components.length === 0) {
+      const els = document.querySelectorAll(`[tetra-subscription="${group}"]`);
+      els.forEach(el => {
+        const component = Alpine.$data(el);
+        if (component && component._removeComponent) {
+          component._removeComponent();
+        }
+      });
+    }
+    components.forEach(component => {
+      if (component && component._removeComponent) {
+        if (
+            sender_id &&
+            component.__activeRequests &&
+            component.__activeRequests.has(sender_id)
+        ) {
+          return;
+        }
+        component._removeComponent();
+      }
+    });
+  },
+  handleComponentCreated(event) {
+    const { group, data, component_id, target_group, sender_id } = event;
+    const components = this._get_components_by_subscribe_group(group);
+    components.forEach((component) => {
+      if (
+          sender_id &&
+          component.__activeRequests &&
+          component.__activeRequests.has(sender_id)
+      ) {
+        return;
+      }
+      component._updateHtml().catch(err => {
+        console.error('Error updating component HTML after creation:', err);
+      });
+    });
+  },
+
+  scheduleQueueRetry() {
+    // Schedule a retry attempt for queued calls after a short delay
+    if (this.queueRetryTimer) {
+      clearTimeout(this.queueRetryTimer);
+    }
+
+    // Only schedule if there are items in the queue
+    if (this.offlineCallQueue.length > 0) {
+      this.queueRetryTimer = setTimeout(() => {
+        this.processOfflineCallQueue();
+      }, 2000); // Retry after 2 seconds
+    }
+  },
+
+  async processOfflineCallQueue() {
+    if (this.offlineCallQueue.length === 0) return;
+
+    const queueLength = this.offlineCallQueue.length;
+    Tetra.debug(`Processing ${queueLength} queued calls from offline mode`);
+
+    // Notify that queue processing has started
+    document.dispatchEvent(new CustomEvent('tetra:queue-processing-start', {
+      detail: { queueLength }
+    }));
+
+    // Process calls in order - copy queue and clear original
+    const queue = [...this.offlineCallQueue];
+    this.offlineCallQueue = [];
+
+    // Process each queued call sequentially
+    for (const queuedCall of queue) {
+      try {
+        const { component, methodName, args, componentMetadata, preCallSnapshot, optimisticUpdate } = queuedCall;
+
+        // Look up component for event dispatching (may have moved or been destroyed)
+        // First try to find by component_id
+        let componentEl = document.querySelector(`[tetra-component-id="${component.component_id}"]`);
+        let componentInstance = componentEl ? Alpine.$data(componentEl) : null;
+
+        // If found but key doesn't match, try to find by key instead
+        // This handles cases where component_id was reused for a different component
+        if (componentInstance && component.key && componentInstance.key !== component.key) {
+          Tetra.debug(`Component ID ${component.component_id} found but key mismatch, searching by key: ${component.key}`);
+
+          // Search all components with any ID to find matching key
+          const allComponents = document.querySelectorAll('[tetra-component-id]');
+          let foundByKey = false;
+          for (const el of allComponents) {
+            const comp = Alpine.$data(el);
+            if (comp && comp.key === component.key) {
+              componentEl = el;
+              componentInstance = comp;
+              foundByKey = true;
+              Tetra.debug(`Found component by key ${component.key} with ID ${comp.component_id}`);
+              break;
+            }
+          }
+
+          if (!foundByKey) {
+            componentEl = null;
+            componentInstance = null;
+          }
+        }
+
+        // Validate that we have the correct component by checking the key
+        // Component IDs can be reused in lists, so we must verify the key matches
+        const isCorrectComponent = componentInstance &&
+            (component.key === undefined || component.key === null || componentInstance.key === component.key);
+
+        if (!componentInstance || !isCorrectComponent) {
+          if (componentInstance && !isCorrectComponent) {
+            Tetra.debug(`Component ${component.component_id} found but key mismatch (queued: ${component.key}, found: ${componentInstance.key}), attempting replay with snapshot state: ${methodName}`);
+          } else {
+            Tetra.debug(`Component ${component.component_id} not found, attempting replay with snapshot state: ${methodName}`);
+          }
+
+          // Try to replay using snapshot state without a component instance
+          const success = await this.replayCallWithoutComponent(queuedCall);
+          if (success) {
+            Tetra.debug(`Successfully replayed ${methodName} without component instance`);
+          } else {
+            Tetra.debug(`Failed to replay ${methodName} - skipping`);
+          }
+          continue;
+        }
+
+        Tetra.debug(`Replaying queued call: ${methodName} (component_id: ${component.component_id}, key: ${component.key})`);
+
+        const requestId = Math.random().toString(36).substring(2, 15);
+        const triggerEl = componentInstance.$el;
+
+        // Get current state for the call
+        let component_state = Tetra.getStateWithChildren(componentInstance);
+        component_state.args = args || [];
+
+        // Get the unified endpoint
+        if (!componentInstance.__serverMethods || componentInstance.__serverMethods.length === 0) {
+          console.error('No server methods available for queued call');
+          continue;
+        }
+        const endpoint = componentInstance.__serverMethods[0].endpoint;
+
+        const metadata = componentMetadata || componentInstance.__componentMetadata;
+        const requestEnvelope = {
+          protocol: "tetra-1.0",
+          id: requestId,
+          type: "call",
+          payload: {
+            component_id: componentInstance.$el.getAttribute('tetra-component-id'),
+            method: methodName,
+            args: component_state.args,
+            state: component_state.data,
+            encrypted_state: component_state.encrypted,
+            children_state: component_state.children,
+            app_name: metadata.app_name,
+            library_name: metadata.library_name,
+            component_name: metadata.component_name,
+          }
+        };
+
+        // Prepare fetch payload
+        let fetchPayload = {
+          method: 'POST',
+          headers: {
+            'T-Request': "true",
+            'T-Current-URL': document.location.href,
+            'X-CSRFToken': window.__tetra_csrfToken,
+            'Content-Type': 'application/json'
+          },
+          mode: 'same-origin',
+          body: Tetra.jsonEncode(requestEnvelope)
+        };
+
+        // Dispatch before-request event
+        componentInstance.$dispatch('tetra:before-request', {
+          component: componentInstance,
+          triggerEl: triggerEl,
+          requestId: requestId
+        });
+
+        try {
+          const response = await fetch(endpoint, fetchPayload);
+
+          // Dispatch after-request event
+          componentInstance.$dispatch('tetra:after-request', {
+            component: componentInstance,
+            triggerEl: triggerEl,
+            requestId: requestId
+          });
+
+          // Handle different HTTP status codes with appropriate reconciliation strategies
+          if (response.status === 401 || response.status === 403) {
+            // Auth error - rollback optimistic changes
+            console.error(`Auth error (${response.status}) replaying queued call to ${methodName}, rolling back`);
+            this.rollbackOptimisticUpdate(componentInstance, preCallSnapshot);
+
+            componentInstance.$dispatch('tetra:call-rolled-back', {
+              component: componentInstance,
+              methodName: methodName,
+              status: response.status,
+              reason: 'auth_error'
+            });
+            continue; // Skip this call, don't retry
+          }
+
+          if (response.status === 409) {
+            // Conflict - refresh component from server
+            console.warn(`Conflict (409) replaying queued call to ${methodName}, refreshing component`);
+            await componentInstance._updateHtml().catch(err => {
+              console.error('Error refreshing component after conflict:', err);
+            });
+
+            componentInstance.$dispatch('tetra:call-conflict', {
+              component: componentInstance,
+              methodName: methodName
+            });
+            continue; // Call succeeded but state was stale, component refreshed
+          }
+
+          if (response.status >= 500) {
+            // Server error - rollback and re-queue for retry
+            console.warn(`Server error (${response.status}) replaying queued call to ${methodName}, will retry`);
+            this.rollbackOptimisticUpdate(componentInstance, preCallSnapshot);
+
+            // Re-queue at the end for retry
+            this.offlineCallQueue.push(queuedCall);
+            continue; // Continue processing other calls
+          }
+
+          if (!response.ok) {
+            // Other 4xx errors - rollback and log
+            console.error(`HTTP error ${response.status} replaying queued call to ${methodName}`);
+            this.rollbackOptimisticUpdate(componentInstance, preCallSnapshot);
+
+            componentInstance.$dispatch('tetra:call-failed', {
+              component: componentInstance,
+              methodName: methodName,
+              status: response.status
+            });
+            continue;
+          }
+
+          // Success (200) - parse response and apply updates
+          const result = await this.handleServerMethodResponse(response, componentInstance);
+
+          Tetra.debug(`Queued call ${methodName} completed successfully`);
+
+          componentInstance.$dispatch('tetra:call-reconciled', {
+            component: componentInstance,
+            methodName: methodName,
+            result: result
+          });
+
+        } catch (error) {
+          // Network error - rollback and re-queue at front
+          const isNetworkError = error instanceof TypeError &&
+              (error.message.includes('fetch') || error.message.includes('NetworkError'));
+
+          if (isNetworkError) {
+            console.warn('Network error during queue replay, rolling back and re-queuing:', error);
+            this.rollbackOptimisticUpdate(componentInstance, preCallSnapshot);
+
+            componentInstance.$dispatch('tetra:after-request', {
+              component: componentInstance,
+              triggerEl: triggerEl,
+              requestId: requestId
+            });
+
+            this.offlineCallQueue.unshift(queuedCall); // Put back at front
+            this.setOfflineStatus();
+            break; // Stop processing queue
+          }
+
+          // For other errors, log and continue
+          console.error('Error replaying queued call:', error);
+          componentInstance.$dispatch('tetra:after-request', {
+            component: componentInstance,
+            triggerEl: triggerEl,
+            requestId: requestId
+          });
+        }
+      } catch (error) {
+        console.error('Error processing queued call:', error);
+        // Continue with next call
+      }
+    }
+
+    // Schedule retry if there are still items in queue (server errors or network issues)
+    if (this.offlineCallQueue.length > 0) {
+      this.scheduleQueueRetry();
+    }
+
+    // Notify that queue processing has completed
+    document.dispatchEvent(new CustomEvent('tetra:queue-processing-complete', {
+      detail: {
+        processedCount: queueLength,
+        remainingCount: this.offlineCallQueue.length
+      }
+    }));
+  },
+
+  async replayCallWithoutComponent(queuedCall) {
+    // Replay a queued call when the component instance is not available in DOM
+    // This uses the snapshot state to reconstruct the request
+    const { component, methodName, args, componentMetadata, preCallSnapshot } = queuedCall;
+
+    if (!preCallSnapshot || !preCallSnapshot.data.__state) {
+      console.warn(`Cannot replay ${methodName} - no snapshot state available`);
+      return false;
+    }
+
+    const requestId = Math.random().toString(36).substring(2, 15);
+    const metadata = componentMetadata;
+
+    // Reconstruct the request envelope from snapshot
+    const requestEnvelope = {
+      protocol: "tetra-1.0",
+      id: requestId,
+      type: "call",
+      payload: {
+        component_id: component.component_id,
+        method: methodName,
+        args: args || [],
+        state: preCallSnapshot.data,
+        encrypted_state: preCallSnapshot.data.__state,
+        children_state: [],
+        app_name: metadata.app_name,
+        library_name: metadata.library_name,
+        component_name: metadata.component_name,
+      }
+    };
+
+    // Get endpoint from metadata or construct from base tetra endpoint
+    const endpoint = window.__tetra_endpoint + 'call/';
+
+    const fetchPayload = {
+      method: 'POST',
+      headers: {
+        'T-Request': "true",
+        'T-Current-URL': document.location.href,
+        'X-CSRFToken': window.__tetra_csrfToken,
+        'Content-Type': 'application/json'
+      },
+      mode: 'same-origin',
+      body: Tetra.jsonEncode(requestEnvelope)
+    };
+
+    try {
+      const response = await fetch(endpoint, fetchPayload);
+
+      // Handle different status codes
+      if (response.status === 401 || response.status === 403) {
+        console.error(`Auth error (${response.status}) replaying ${methodName} without component - skipping`);
+        return false;
+      }
+
+      if (response.status === 409) {
+        console.warn(`Conflict (409) replaying ${methodName} without component - state was stale`);
+        return true; // Consider it handled
+      }
+
+      if (response.status >= 500) {
+        console.warn(`Server error (${response.status}) replaying ${methodName} without component - will retry`);
+        // Re-queue for retry
+        this.offlineCallQueue.push(queuedCall);
+        return false;
+      }
+
+      if (!response.ok) {
+        console.error(`HTTP error ${response.status} replaying ${methodName} without component`);
+        return false;
+      }
+
+      // Success - parse response
+      const respData = await response.json();
+
+      // Handle messages globally
+      if (respData.metadata?.messages) {
+        respData.metadata.messages.forEach((message) => {
+          document.dispatchEvent(new CustomEvent('tetra:new-message', { detail: message }));
+        });
+      }
+
+      // Dispatch global event for successful replay without component
+      document.dispatchEvent(new CustomEvent('tetra:call-replayed-without-component', {
+        detail: {
+          componentId: component.component_id,
+          methodName: methodName,
+          response: respData
+        }
+      }));
+
+      return true;
+    } catch (error) {
+      const isNetworkError = error instanceof TypeError &&
+        (error.message.includes('fetch') || error.message.includes('NetworkError'));
+
+      if (isNetworkError) {
+        console.warn('Network error during replay without component, re-queuing:', error);
+        this.offlineCallQueue.unshift(queuedCall);
+        this.setOfflineStatus();
+        return false;
+      }
+
+      console.error('Error replaying call without component:', error);
+      return false;
+    }
+  },
+
+  rollbackOptimisticUpdate(component, preCallSnapshot) {
+    if (!preCallSnapshot) return;
+
+    // Restore public state from snapshot
+    for (const key in preCallSnapshot.data) {
+      if (component.hasOwnProperty(key)) {
+        component[key] = preCallSnapshot.data[key];
+      }
+    }
+
+    // Restore HTML if available
+    if (preCallSnapshot.html && component.$el) {
+      try {
+        Alpine.morph(component.$root, preCallSnapshot.html, {
+          lookahead: true
+        });
+        Tetra.debug('Rolled back component HTML to pre-call state');
+      } catch (error) {
+        console.error('Error during rollback morph:', error);
+      }
+    }
+
+    component.$dispatch('tetra:state-rolled-back', { component: component });
+  },
+
+  captureComponentSnapshot(component) {
+    // Capture current component state for potential rollback
+    const snapshot = {
+      data: {},
+      html: component.$el ? component.$el.outerHTML : null,
+      timestamp: Date.now()
+    };
+
+    // Copy all public properties
+    for (const key in component) {
+      if (!key.startsWith('_') && !key.startsWith('$') && !key.startsWith('__') &&
+          typeof component[key] !== 'function') {
+        // Deep clone the value to prevent reference issues
+        try {
+          snapshot.data[key] = JSON.parse(JSON.stringify(component[key]));
+        } catch (e) {
+          // If value can't be serialized, store reference (best effort)
+          snapshot.data[key] = component[key];
+        }
+      }
+    }
+
+    // Capture encrypted state (needed for server-side validation)
+    if (component.__state) {
+      snapshot.data.__state = component.__state;
+    }
+
+    // Capture component metadata (needed for endpoint routing)
+    if (component.component_id) {
+      snapshot.component_id = component.component_id;
+    }
+    if (component.key) {
+      snapshot.key = component.key;
+    }
+
+    Tetra.debug(`Captured snapshot for component '${component.componentName}' (id: ${component.component_id}, key: ${component.key})`);
+    return snapshot;
+  },
+
+  queueOfflineCall(component, methodName, args, componentMetadata, preCallSnapshot, optimisticUpdate) {
+    Tetra.debug(`Queuing call to ${methodName} - connection offline`);
+
+    // Queue the call with all necessary context for replay
+    this.offlineCallQueue.push({
+      component: {
+        component_id: component.component_id,
+        key: component.key
+      },
+      methodName,
+      args,
+      componentMetadata,
+      preCallSnapshot, // Snapshot for rollback
+      optimisticUpdate, // Info about what was optimistically changed
+      queuedAt: Date.now()
+    });
+
+    // Dispatch event to notify that call was queued
+    component.$dispatch('tetra:call-queued', {
+      component: component,
+      methodName: methodName,
+      queueLength: this.offlineCallQueue.length
+    });
+
+    Tetra.debug(`Call queued: ${methodName}, component id: ${component.component_id} (queue length: ${this.offlineCallQueue.length})`);
+  },
+
+  sendWebSocketMessage(message) {
+    if (!this.ws) {
+      console.log("WebSocket is not connected. Cannot send message.");
+      return
+    }
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+    } else {
+      // Store subscription messages until connection is ready
+      if (message.type === 'subscribe' && message.component_id) {
+        this.pendingSubscriptions.set(message.component_id, message);
+      }
+      // Queue other messages
+      this.ws.addEventListener('open', () => {
+        this.ws.send(JSON.stringify(message));
+      }, { once: true });
+    }
+  },
+  alpineComponentMixins() {
+    return {
+      // Alpine.js lifecycle:
+      init() {
+        this.component_id = this.$el.getAttribute('tetra-component-id');
+        this.$dispatch('tetra:child-component-init', {component:  this});
+        // Set component ID attribute on DOM element for targeting
+        this.__initServerWatchers();
+        this.__initStores();
+
+        // Auto-subscribe if component is reactive
+        if (window.__tetra_useWebsockets && this.$el.hasAttribute('tetra-reactive')) {
+          Tetra.ensureWebSocketConnection();
+
+          // Handle dynamic subscriptions from template
+          const group = this.$el.getAttribute('tetra-subscription');
+          if (group) {
+            this._subscribe(group);
+          }
+        }
+
+        if (this.__initInner) {
+          this.__initInner();
+        }
+
+        this._handleAutofocus();
+
+        const addClassToExternalIndicators = () => {
+          // adds `tetra-indicator` class to all elements targeted with `t-indicator` attribute
+          const elementsWithIndicator = [this.$el, ...Array.from(this.$el.querySelectorAll('[t-indicator]'))]
+          elementsWithIndicator.forEach(el => {
+            const indicators = el.getAttribute('t-indicator')
+            if (indicators) {
+              // If an explicit selector is given, hide it and add marker class to find it later
+              document.querySelectorAll(indicators).forEach(indicator => {
+                if (indicator.getAttribute('hidden') === null) {
+                  // indicator.setAttribute('hidden', '');
+                  indicator.hidden = true;
+                }
+                indicator.classList.add('tetra-indicator-' + this.component_id);
+              });
+            }
+          });
+        };
+        addClassToExternalIndicators();
+        this.$el.addEventListener('tetra:component-updated', addClassToExternalIndicators);
+
+        const handleRequestEvent = (event, isBefore) => {
+          const triggerEl = event.detail.triggerEl || event.target;
+          const requestId = event.detail.requestId;
+
+          if (!this.$el.contains(triggerEl) && this.$el !== triggerEl) return;
+
+          if (!this.__activeRequests) {
+            this.__activeRequests = new Map();
+          }
+
+          if (isBefore) {
+            let triggerSelector = '';
+            if (triggerEl.id) {
+              triggerSelector = '#' + triggerEl.id;
+            }
+            this.__activeRequests.set(requestId, {
+              triggerSelector: triggerSelector,
+              indicatorSelector: triggerEl.getAttribute('t-indicator'),
+              completed: false,
+            });
+          } else {
+            const request = this.__activeRequests.get(requestId);
+            if (request) {
+              request.completed = true;
+            }
+            // We keep it in the map for a short while after the request is "completed"
+            // to allow handleComponentUpdateData to catch late-arriving WS messages.
+            setTimeout(() => {
+              this.__activeRequests.delete(requestId);
+            }, 500);
+          }
+
+          const updateElementState = (el, reqId, isStart) => {
+            if (!el.__activeRequests) el.__activeRequests = new Set();
+            if (isStart) el.__activeRequests.add(reqId);
+            else el.__activeRequests.delete(reqId);
+            return el.__activeRequests.size > 0;
+          }
+
+          const hasActive = updateElementState(triggerEl, requestId, isBefore);
+          triggerEl.classList.toggle("tetra-request", hasActive);
+
+          const selector = triggerEl.getAttribute('t-indicator');
+          if (selector) {
+            const localIndicators = Array.from(this.$el.querySelectorAll(selector))
+            const globalIndicators = Array.from(document.querySelectorAll('.tetra-indicator-' + this.component_id))
+
+            const allIndicators = new Set(localIndicators)
+            globalIndicators.forEach(el => {
+              if (el.matches(selector)) {
+                allIndicators.add(el)
+              }
+            })
+
+            allIndicators.forEach(el => {
+              const active = updateElementState(el, requestId, isBefore);
+              if (active) {
+                el.removeAttribute('hidden');
+                el.hidden = false;
+              } else {
+                el.setAttribute('hidden', '');
+                el.hidden = true;
+              }
+            })
+          }
+        };
+
+        const reapplyLoadingState = () => {
+          if (!this.__activeRequests || this.__activeRequests.size === 0) return;
+
+          this.__activeRequests.forEach((info, reqId) => {
+            // ONLY reapply if the request is NOT yet completed.
+            // If it is completed, it's only in the Map to block WS updates.
+            if (info.completed) return;
+
+            if (info.triggerSelector) {
+              const triggers = this.$el.querySelectorAll(info.triggerSelector);
+              triggers.forEach(el => {
+                if (!el.__activeRequests) el.__activeRequests = new Set();
+                el.__activeRequests.add(reqId);
+                el.classList.add("tetra-request");
+              });
+            }
+            if (info.indicatorSelector) {
+              const localIndicators = Array.from(this.$el.querySelectorAll(info.indicatorSelector))
+              const globalIndicators = Array.from(document.querySelectorAll('.tetra-indicator-' + this.component_id))
+
+              const allIndicators = new Set(localIndicators)
+              globalIndicators.forEach(el => {
+                if (el.matches(info.indicatorSelector)) {
+                  allIndicators.add(el)
+                }
+              })
+              
+              allIndicators.forEach(el => {
+                if (!el.__activeRequests) el.__activeRequests = new Set();
+                el.__activeRequests.add(reqId);
+                el.removeAttribute('hidden');
+                el.hidden = false;
+              });
+            }
+          });
+        };
+
+        this.$el.addEventListener("tetra:before-request", (event) => handleRequestEvent(event, true));
+        this.$el.addEventListener("tetra:after-request", (event) => handleRequestEvent(event, false));
+        this.$el.addEventListener('tetra:component-updated', reapplyLoadingState);
+      },
+      destroy() {
+        this.$dispatch('tetra:child-component-destroy', {component:  this});
+
+        // Check if this component or any parent is currently updating
+        // to prevent unsubscription during morphing (could be a race condition!)
+        let isParentUpdating = false;
+        let current = this.$el.parentElement;
+        while (current) {
+          const parentComponent = current._x_dataStack?.[0];
+          if (parentComponent && parentComponent.__isUpdating) {
+            isParentUpdating = true;
+            break;
+          }
+          current = current.parentElement;
+        }
+
+        // Unsubscribe from all groups when component is destroyed
+        // but NOT if this component or a parent is being morphed/updated
+        // because it most probably is a replacement!
+        if (!this.__isUpdating && !isParentUpdating && this.__subscribedGroups) {
+          [...this.__subscribedGroups].forEach(group => {
+            this._unsubscribe(group);
+          });
+        }
+
+        if (this.__destroyInner) {
+          this.__destroyInner();
+        }
+      },
+      async _updateHtml(html) {
+        // If no HTML is provided, fetch it from the server
+        if (!html) {
+          html = await this._fetchHtml();
+        }
+
+        // Validate HTML before morphing
+        if (!html) return;
+
+        this.__isUpdating = true;
+        try {
+          Alpine.morph(this.$root, html, {
+            updating(el, toEl, childrenOnly, skip) {
+              if (toEl.hasAttribute && toEl.hasAttribute('x-data-maintain') && el.hasAttribute && el.hasAttribute('x-data')) {
+                toEl.setAttribute('x-data', el.getAttribute('x-data'));
+                toEl.removeAttribute('x-data-maintain');
+              } else if (toEl.hasAttribute && toEl.hasAttribute('x-data-update') && el.hasAttribute && el.hasAttribute('x-data')) {
+                let data = Tetra.jsonDecode(toEl.getAttribute('x-data-update'));
+                let old_data = Tetra.jsonDecode(toEl.getAttribute('x-data-update-old'));
+                let comp = window.Alpine.$data(el);
+                for (const key in data) {
+                  if (old_data.hasOwnProperty(key) && (old_data[key] !== comp[key])) {
+                    // If the data that was submitted to the server has since changed we don't overwrite it
+                    continue
+                  }
+                  comp[key] = data[key];
+                }
+                toEl.setAttribute('x-data', el.getAttribute('x-data'));
+                toEl.removeAttribute('x-data-update');
+              }
+            },
+            lookahead: true
+          });
+        } catch (error) {
+          console.error('Error during Alpine.morph:', error);
+          console.error('HTML that caused the error:', html);
+          // Don't throw - just log and continue
+        } finally {
+          this.__isUpdating = false;
+        }
+
+        this._handleAutofocus();
+        this.$dispatch('tetra:component-updated', { component: this });
+      },
+      _updateData(data) {
+        let activeEl = document.activeElement;
+        let focusedModel = null;
+        if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT') && this.$el.contains(activeEl)) {
+          // Check if the focused element is bound to a model
+          focusedModel = activeEl.getAttribute('x-model');
+          if (!focusedModel) {
+            // also check for x-model on parent elements, up to the component root
+            let el = activeEl.parentElement;
+            while (el && el !== this.$el && !focusedModel) {
+              focusedModel = el.getAttribute('x-model');
+              el = el.parentElement;
+            }
+          }
+        }
+
+        for (const key in data) {
+          if (focusedModel === key) {
+            Tetra.debug(`Skipping update for focused field: ${key}`);
+            continue;
+          }
+          this[key] = data[key];
+        }
+        // this._handleAutofocus(); // TODO: evaluate if this would make sense too
+        this.$dispatch('tetra:component-data-updated', { component: this });
+      },
+      _setValueByName(name, value){
+        // sets value to the input field with the given name
+        // This is especially useful for emptying a file field, as the browser doesn't do that on page refreshes.
+        let inputs = document.getElementsByName(name);
+        for (let i = 0; i < inputs.length; i++) {
+          inputs[i].value = value;
+        }
+      },
+      _removeComponent() {
+        this.$dispatch('tetra:component-before-remove', { component: this });
+        this.$root.remove();
+        Tetra.debug(`Removed component with key ${this.key} and ID ${this.component_id}`);
+      },
+      _replaceComponent(html) {
+        this.__isUpdating = true;
+        this.$dispatch('tetra:component-before-remove', { component: this });
+        this.$root.insertAdjacentHTML('afterend', html);
+        this.$root.remove();
+        this.__isUpdating = false;
+        this.$dispatch('tetra:component-updated', { component: this });
+        this._handleAutofocus();
+        Tetra.debug(`Replaced component with key ${this.key} and ID ${this.component_id}`);
+      },
+      _redirect(url) {
+        document.location = url;
+      },
+      _dispatch(name, data) {
+        this.$dispatch(name, {
+          _component: this,
+          ...data
+        });
+      },
+      _pushUrl(url, replace=false) {
+        if(replace){
+          window.history.replaceState(null, '', url);
+        } else {
+          window.history.pushState(null, '', url);
+        }
+      },
+      _updateSearchParam(param, value) {
+        const url = new URL(window.location);
+        if (value) {
+          url.searchParams.set(param, value);
+        } else {
+          url.searchParams.delete(param);
+        }
+        window.history.pushState(null, "", url.toString());
+      },
+      _handleAutofocus() {
+        this.$nextTick(() => {
+          if (!this.$root) {
+            return;
+          }
+          const focus_el = this.$root.querySelector("[autofocus]");
+          if (focus_el) {
+            focus_el.focus();
+          }
+        });
+      },
+      async _fetchHtml() {
+        // Fetch fresh HTML from the server for this component by calling the special _refresh method
+        // The _refresh method uses the unified endpoint like all other methods
+        const refreshMethod = this.__serverMethods?.find(m => m.name === '_refresh');
+        if (!refreshMethod) {
+          throw new Error('_refresh method not found in component server methods');
+        }
+
+        // Use the standard callServerMethod for consistent behavior
+        // Pass the componentMetadata from this component instance
+        const result = await Tetra.callServerMethod(this, '_refresh', [], this.__componentMetadata);
+
+        // The result from _refresh contains the html in the response
+        return result?.html || result;
+      },
+
+      // Push notification methods
+      _subscribe(topic) {
+        if (!this.__subscribedGroups) {
+          this.__subscribedGroups = new Set();
+        }
+
+        const store = Alpine.store('tetra_subscriptions');
+        
+        this.__subscribedGroups.add(topic);
+        
+        if (!store[topic]) {
+          store[topic] = [];
+        }
+        
+        if (!store[topic].includes(this.component_id)) {
+          const isFirst = store[topic].length === 0;
+          store[topic].push(this.component_id);
+
+          if (isFirst) {
+            Tetra.sendWebSocketMessage({
+              type: 'subscribe',
+              group: topic,
+              component_id: this.component_id,
+              component_class: this.componentName,
+            });
+          }
+        }
+      },
+
+      _unsubscribe(topic) {
+        if (!this.__subscribedGroups) return;
+        const store = Alpine.store('tetra_subscriptions');
+
+        this.__subscribedGroups.delete(topic);
+
+        if (store[topic]) {
+          const index = store[topic].indexOf(this.component_id);
+          if (index > -1) {
+            store[topic].splice(index, 1);
+            const isLast = store[topic].length === 0;
+
+            // Check if ANY parent component is currently morphing
+            // If so, don't actually unsubscribe from the WebSocket - the component
+            // is likely being recreated during the morph
+            let isParentMorphing = false;
+            if (this.$el) {
+              let current = this.$el.parentElement;
+              while (current) {
+                const parentComponent = current._x_dataStack?.[0];
+                if (parentComponent && parentComponent.__isUpdating) {
+                  isParentMorphing = true;
+                  break;
+                }
+                current = current.parentElement;
+              }
+            }
+
+            if (isLast && !isParentMorphing) {
+              delete store[topic];
+              Tetra.sendWebSocketMessage({
+                type: 'unsubscribe',
+                group: topic,
+                component_id: this.component_id
+              });
+            } else if (isLast && isParentMorphing) {
+              // Don't delete from store or send unsubscribe - component is being recreated
+              if (window.__tetra_debug) {
+                Tetra.debug(`Skipping unsubscribe from ${topic} - parent is morphing, component likely being recreated`);
+              }
+            } else if (window.__tetra_debug) {
+              Tetra.debug(`Component ${this.component_id} unsubscribed from ${topic}, but ${store[topic].length} components still subscribed`);
+            }
+          }
+        }
+      },
+
+      _notifyGroup(groupName, eventName, data) {
+        return Tetra.sendWebSocketMessage({
+          type: 'notify',
+          group: groupName,
+          event_name: eventName,
+          data: data,
+          sender_id: this.component_id
+        });
+      },
+
+
+      // Tetra private:
+      __initServerWatchers() {
+        this.__serverMethods.forEach(item => {
+          if (item.watch) {
+            item.watch.forEach(propName => {
+              this.$watch(propName, async (value, oldValue) => {
+                await this[item.name](value, oldValue, propName);
+              })
+            })
+          }
+        })
+      },
+      __initStores() {
+        if (!this.__serverStores) return;
+
+        Object.entries(this.__serverStores).forEach(([propName, storePath]) => {
+          const parts = storePath.split('.');
+          const storeName = parts[0];
+          const propertyPath = parts.slice(1);
+
+          // Initialize store if it doesn't exist
+          if (!Alpine.store(storeName)) {
+            Alpine.store(storeName, {});
+          }
+
+          const getStoreValue = () => {
+            let val = Alpine.store(storeName);
+            for (const part of propertyPath) {
+              if (val === undefined || val === null || typeof val !== 'object') return undefined;
+              val = val[part];
+            }
+            return val;
+          };
+
+          const setStoreValue = (value) => {
+            if (propertyPath.length === 0) {
+              if (Alpine.store(storeName) !== value) {
+                Alpine.store(storeName, value);
+              }
+            } else {
+              let obj = Alpine.store(storeName);
+              for (let i = 0; i < propertyPath.length - 1; i++) {
+                const part = propertyPath[i];
+                if (!(part in obj) || typeof obj[part] !== 'object') obj[part] = {};
+                obj = obj[part];
+              }
+              const lastPart = propertyPath[propertyPath.length - 1];
+              if (obj[lastPart] !== value) {
+                obj[lastPart] = value;
+              }
+            }
+          };
+
+          // Track previous store value to detect actual store changes
+          let prevStoreVal = getStoreValue();
+
+          // Two-way sync: Store -> Component
+          Alpine.effect(() => {
+            const storeVal = getStoreValue();
+
+            // Only update component if the STORE value actually changed
+            if (storeVal !== prevStoreVal && storeVal !== undefined) {
+              prevStoreVal = storeVal;
+              if (this[propName] !== storeVal) {
+                this.__isSyncingFromStore = propName;
+                this[propName] = storeVal;
+                this.$nextTick(() => {
+                  if (this.__isSyncingFromStore === propName) {
+                    this.__isSyncingFromStore = null;
+                  }
+                });
+              }
+            }
+          });
+
+          // Two-way sync: Component -> Store
+          this.$watch(propName, (value) => {
+            if (this.__isSyncingFromStore !== propName) {
+              const currentStoreVal = getStoreValue();
+              if (currentStoreVal !== value) {
+                setStoreValue(value);
+                prevStoreVal = value; // Update tracking after successful store update
+              }
+            }
+          });
+
+          // Initial sync: Check if store already has a value
+          const initialStoreVal = getStoreValue();
+          if (initialStoreVal !== undefined) {
+            // Store already has a value (set by another component)
+            // Update component to match the store immediately
+            this[propName] = initialStoreVal;
+            prevStoreVal = initialStoreVal;
+          } else {
+            // Store doesn't have a value yet
+            // Initialize it with this component's value
+            setStoreValue(this[propName]);
+            prevStoreVal = this[propName];
+          }
+        });
+      },
+      __childComponents: {},
+      __rootBind: {
+        ['@tetra:child-component-init'](event) {
+          event.stopPropagation();
+          const comp = event.detail.component;
+          if (comp.key === this.key) {
+            return
+          }
+          if (comp.key) {
+            this.__childComponents[comp.key] = comp;
+          }
+          comp._parent = this;
+        },
+        ['@tetra:child-component-destroy'](event) {
+          event.stopPropagation();
+          const comp = event.detail.component;
+          if (comp.key === this.key) {
+            return
+          }
+          delete this.__childComponents[comp.key];
+          event.detail.component._parent = null;
+        }
+      }
+    }
+  },
+
+  makeServerMethods(serverMethods, componentMetadata) {
+    const methods = {};
+    serverMethods.forEach((serverMethod) => {
+      var func = async function(...args) {
+        // TODO: ensure only one concurrent?
+        return await Tetra.callServerMethod(this, serverMethod.name, args, componentMetadata)
+      }
+      if (serverMethod.debounce) {
+        func = Tetra.debounce(func, serverMethod.debounce, serverMethod.debounce_immediate)
+      } else if (serverMethod.throttle) {
+        func = Tetra.throttle(func, serverMethod.throttle, {
+          leading: serverMethod.throttle_leading,
+          trailing: serverMethod.throttle_trailing
+        })
+      }
+      methods[serverMethod.name] = func;
+    })
+    return methods
+  },
+
+  makeAlpineComponent(componentName, script, serverMethods, serverProperties, componentMetadata) {
+    Alpine.data(
+        componentName,
+        (initialDataJson) => {
+          const {init, destroy, ...script_rest} = script;
+          const initialData = Tetra.jsonDecode(initialDataJson);
+          const data = {
+            componentName,
+            __initInner: init,
+            __destroyInner: destroy,
+            __serverMethods: serverMethods,
+            __serverProperties: serverProperties,
+            __componentMetadata: componentMetadata,
+            __serverStores: initialData?.__serverStores,
+            ...(initialData || {}),
+            ...script_rest,
+            ...Tetra.makeServerMethods(serverMethods, componentMetadata),
+            ...Tetra.alpineComponentMixins(),
+          }
+          return data
+        }
+    )
+  },
+
+  getStateWithChildren(component) {
+    const data = {}
+    component.__serverProperties.forEach((key) => {
+      data[key] = component[key]
+    })
+    if (component.__serverStores) {
+      data["__serverStores"] = component.__serverStores;
+    }
+    const r = {
+      encrypted: component.__state,
+      data: data,
+      children: []
+    }
+    for (const key in component.__childComponents) {
+      const comp = component.__childComponents[key];
+      r.children.push(Tetra.getStateWithChildren(comp));
+    }
+    return r;
+  },
+
+  loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  },
+
+  loadStyles(href) {
+    return new Promise((resolve, reject) => {
+      const link = document.createElement('link');
+      link.href = href;
+      link.rel  = 'stylesheet';
+      link.type = 'text/css';
+      link.onload = resolve;
+      link.onerror = reject;
+      document.head.appendChild(link);
+    });
+  },
+  getFilenameFromContentDisposition(contentDisposition) {
+    if (!contentDisposition) return null;
+
+    // First, try to get the filename* parameter (RFC 5987)
+    let matches = /filename\*=([^']*)'([^']*)'([^;]*)/i.exec(contentDisposition);
+    if (matches) {
+      // Decode the UTF-8 encoded filename
+      try {
+        return decodeURIComponent(matches[3]);
+      } catch (e) {
+        console.warn('Error decoding filename:', e);
+      }
+    }
+    // Try to get the regular filename parameter
+    matches = /filename=["']?([^"';\n]*)["']?/i.exec(contentDisposition);
+    if (matches) {
+      return matches[1];
+    }
+    return null;
+  },
+
+  async handleServerMethodResponse(response, component) {
+    // Handle 410 Gone - component state is stale (data was deleted)
+    if (response.status === 410) {
+      const responseText = await response.text();
+      const respData = Tetra.jsonDecode(responseText);
+
+      if (respData.error && respData.error.code === 'StaleComponentState') {
+        console.warn(`Component has stale state: ${respData.error.message}`);
+        // Gracefully remove the component from the DOM
+        if (component && component._removeComponent) {
+          component._removeComponent();
+        }
+        // Emit event for custom handling if needed
+        document.dispatchEvent(new CustomEvent('tetra:component-stale', {
+          detail: {
+            component: component,
+            error: respData.error
+          }
+        }));
+        return null;
+      }
+      // If not a stale state error, fall through to generic error handling
+    }
+
+    if (response.status === 200) {
+      const cd = response.headers.get('Content-Disposition')
+      if (cd?.startsWith("attachment")) {
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(await response.blob())
+        a.download = this.getFilenameFromContentDisposition(cd)
+        a.click()
+        a.remove()
+        return;
+      }
+
+      const responseText = await response.text();
+      const respData = Tetra.jsonDecode(responseText);
+
+      let success = false;
+      let result = null;
+      let html = null;
+      let js = [];
+      let styles = [];
+      let messages = [];
+      let callbacks = [];
+
+      if (respData.protocol !== "tetra-1.0") {
+        throw new Error('Invalid or missing Tetra protocol in server response');
+      }
+
+      success = respData.success;
+      if (respData.payload) {
+        result = respData.payload.result;
+        html = respData.payload.html;
+      }
+      if (respData.metadata) {
+        js = respData.metadata.js || [];
+        styles = respData.metadata.styles || [];
+        messages = respData.metadata.messages || [];
+        callbacks = respData.metadata.callbacks || [];
+
+        // Fast lane for redirects
+        const redirectCallback = callbacks.find(item =>
+            item.callback && item.callback.length === 1 && item.callback[0] === '_redirect'
+        );
+        if (redirectCallback && redirectCallback.args && redirectCallback.args.length > 0) {
+          document.location = redirectCallback.args[0];
+          return;
+        }
+      }
+      if (!success && respData.error) {
+        console.error(`Tetra method error [${respData.error.code}]: ${respData.error.message}`);
+        // Emit event for custom error handling
+        document.dispatchEvent(new CustomEvent('tetra:method-error', {
+          detail: {
+            component: component,
+            error: respData.error
+          }
+        }));
+      }
+
+      // handle Django messages and emit "tetra:new-message" for each one
+      if (messages) {
+        messages.forEach((message) => {
+          component.$dispatch('tetra:new-message', message)
+        })
+      }
+
+      if (success) {
+        let loadingResources = [];
+        js.forEach(src => {
+          if (!document.querySelector(`script[src="${CSS.escape(src)}"]`)) {
+            loadingResources.push(Tetra.loadScript(src));
+          }
+        })
+        styles.forEach(src => {
+          if (!document.querySelector(`link[href="${CSS.escape(src)}"]`)) {
+            loadingResources.push(Tetra.loadStyles(src));
+          }
+        })
+        await Promise.all(loadingResources);
+
+        if (html) {
+          component._updateHtml(html);
+        }
+
+        if (callbacks) {
+          // Whitelist of allowed callback methods to prevent arbitrary code execution
+          const ALLOWED_CALLBACKS = new Set([
+            '_redirect', '_updateHtml', '_updateData', '_dispatch',
+            '_pushUrl', '_updateSearchParam', '_replaceComponent',
+            '_removeComponent', '_setValueByName'
+          ]);
+
+          callbacks.forEach((item) => {
+            // Validate callback structure
+            if (!item.callback || !Array.isArray(item.callback) || item.callback.length === 0) {
+              console.error('Invalid callback structure: missing or invalid callback array');
+              return;
+            }
+
+            const methodName = item.callback[0];
+
+            // Security check: only allow whitelisted top-level methods
+            if (!ALLOWED_CALLBACKS.has(methodName)) {
+              console.error(`Blocked disallowed callback method: ${methodName}`);
+              return;
+            }
+
+            // Security check: prevent prototype chain traversal
+            if (item.callback.some(name =>
+              name === '__proto__' || name === 'constructor' || name === 'prototype'
+            )) {
+              console.error('Blocked callback with dangerous property access');
+              return;
+            }
+
+            // iterate down path to callback
+            let obj = component;
+            try {
+              item.callback.forEach((name, i) => {
+                if (i === item.callback.length-1) {
+                  if (typeof obj[name] === 'function') {
+                    obj[name](...item.args);
+                  } else {
+                    console.error(`Callback target is not a function: ${name}`);
+                  }
+                } else {
+                  obj = obj[name];
+                }
+              });
+            } catch (e) {
+              console.error('Error executing callback:', e);
+            }
+          });
+        }
+        return result;
+      } else {
+        if (respData.error) {
+          throw new Error(`Error processing public method: ${respData.error.message}`);
+        }
+        throw new Error('Error processing public method');
+      }
+    } else {
+      throw new Error(`Server responded with an error ${response.status} (${response.statusText})`);
+    }
+  },
+
+  async callServerMethod(component, methodName, args, componentMetadata) {
+    const requestId = Math.random().toString(36).substring(2, 15);
+    const triggerEl = component.$event ? component.$event.target : component.$el;
+
+    // Debug: Log which component is being called
+    Tetra.debug(`callServerMethod: ${methodName} on component ${component.component_id} (key: ${component.key})`);
+
+    // Capture component snapshot BEFORE making any changes (for rollback)
+    const preCallSnapshot = this.captureComponentSnapshot(component);
+
+    // Get the unified endpoint URL from the first server method
+    // Note: _refresh is always added to server methods, so this should never be empty
+    if (!component.__serverMethods || component.__serverMethods.length === 0) {
+      console.error('No server methods available. Component may not be properly initialized.');
+      return Promise.reject(new Error('No server methods available'));
+    }
+    const endpoint = component.__serverMethods[0].endpoint;
+
+    // Use passed componentMetadata or fall back to component property
+    const metadata = componentMetadata || component.__componentMetadata;
+
+    // Check if we're offline
+    // 1. Browser offline mode (DevTools or actual network)
+    // 2. WebSocket disconnected (for reactive components)
+    const isBrowserOffline = !navigator.onLine;
+    const isReactive = window.__tetra_useWebsockets && component.$el?.hasAttribute('tetra-reactive');
+    const isWebSocketOffline = isReactive && (!this.ws || this.ws.readyState !== WebSocket.OPEN);
+
+    // If offline, queue immediately with snapshot
+    if (isBrowserOffline || isWebSocketOffline) {
+      this.queueOfflineCall(component, methodName, args, metadata, preCallSnapshot, null);
+      return null;
+    }
+
+    // Prepare request
+    let component_state = Tetra.getStateWithChildren(component);
+    component_state.args = args || [];
+
+    const requestEnvelope = {
+      protocol: "tetra-1.0",
+      id: requestId,
+      type: "call",
+      payload: {
+        component_id: component.$el.getAttribute('tetra-component-id'),
+        method: methodName,
+        args: component_state.args,
+        state: component_state.data,
+        encrypted_state: component_state.encrypted,
+        children_state: component_state.children,
+        // Add component location metadata for the unified endpoint
+        app_name: metadata.app_name,
+        library_name: metadata.library_name,
+        component_name: metadata.component_name,
+      }
+    };
+
+    let fetchPayload = {
+      method: 'POST',
+      headers: {
+        'T-Request': "true",
+        'T-Current-URL': document.location.href,
+        'X-CSRFToken': window.__tetra_csrfToken,
+      },
+      mode: 'same-origin',
+    }
+
+    let formData = new FormData();
+    let hasFiles = false;
+    for(const [key, value] of Object.entries(component_state.data)){
+      // TODO: handle multi-file uploads
+      if (value instanceof File) {
+        hasFiles = true;
+        // A file is not uploaded anyway, as the browser automatically deletes the data if submitted within a JSON.
+        // On the server, only an empty {} will arrive, so we can set it to {} anyway.
+        // In the protocol, we keep the original state, but when sending we might need to adjust.
+        requestEnvelope.payload.state[key] = {};
+        formData.append(key, value);
+        // TODO: prevent re-uploading of files that are already uploaded.
+      }
+    }
+
+    // check if FormData has *any* entry - and if not, send JSON request
+    if (hasFiles) {
+      formData.append('tetra_payload', Tetra.jsonEncode(requestEnvelope));
+      fetchPayload.body = formData;
+    } else {
+      fetchPayload.body = Tetra.jsonEncode(requestEnvelope)
+      fetchPayload.headers['Content-Type'] = 'application/json'
+    }
+
+    component.$dispatch('tetra:before-request', {
+      component: component,
+      triggerEl: triggerEl,
+      requestId: requestId
+    });
+    this.updateOnlineStatus();
+
+    // Try to make the request, queue if network error occurs
+    try {
+      const response = await fetch(endpoint, fetchPayload);
+      component.$dispatch('tetra:after-request', {
+        component: component,
+        triggerEl: triggerEl,
+        requestId: requestId
+      })
+      const result = await this.handleServerMethodResponse(response, component);
+
+      // If there are queued calls and this request succeeded, schedule queue retry
+      if (this.offlineCallQueue.length > 0) {
+        this.scheduleQueueRetry();
+      }
+
+      return result;
+    } catch (error) {
+      // Check if it's a network error (connection refused, DNS failure, etc.)
+      const isNetworkError = error instanceof TypeError ||
+                            error.message.toLowerCase().includes('network') ||
+                            error.message.toLowerCase().includes('fetch');
+
+      if (isNetworkError) {
+        console.warn(`Network error calling ${methodName}, queueing for retry:`, error.message);
+
+        // Dispatch after-request to clear current loading state
+        component.$dispatch('tetra:after-request', {
+          component: component,
+          triggerEl: triggerEl,
+          requestId: requestId
+        });
+
+        // Queue the call for retry when connection is restored
+        this.queueOfflineCall(component, methodName, args, metadata, preCallSnapshot, null);
+
+        // Set offline status
+        this.setOfflineStatus();
+
+        return null;
+      }
+
+      // For other errors (like server errors), dispatch after-request and re-throw
+      component.$dispatch('tetra:after-request', {
+        component: component,
+        triggerEl: triggerEl,
+        requestId: requestId
+      });
+      throw error;
+    }
+  },
+
+  jsonReplacer(key, value) {
+    if (value instanceof Date) {
+      return {
+        __type: 'datetime',
+        value: value.toISOString(),
+      };
+    } else if (value instanceof Set) {
+      return {
+        __type: 'set',
+        value: Array.from(value)
+      };
+    }
+    // else if (value?.[0] instanceof File) {
+    //   return {
+    //     __type: 'file',
+    //     name: value[0].name,
+    //     value: value[0],
+    //     size: value[0].size,
+    //     content_type: value[0].type,
+    //   };
+    // }
+    return value;
+  },
+
+  jsonReviver(key, value) {
+    if (value && typeof value === 'object' && value.__type) {
+      if (value.__type === 'datetime') {
+        return new Date(value);
+      } else if (value.__type === 'set') {
+        return new Set(value);
+      }
+    }
+    return value
+  },
+
+  jsonEncode(obj) {
+    return JSON.stringify(obj, Tetra.jsonReplacer);
+  },
+
+  jsonDecode(s) {
+    return JSON.parse(s, Tetra.jsonReviver)
+  },
+
+  debounce(func, wait, immediate) {
+    var timeout
+    return function() {
+      var context = this, args = arguments
+      var later = function () {
+        timeout = null
+        if (!immediate) func.apply(context, args);
+      }
+      var callNow = immediate && !timeout;
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+      if (callNow) func.apply(context, args);
+    }
+  },
+
+  throttle(func, wait, options) {
+    // From Underscore.js
+    // https://underscorejs.org
+    // (c) 2009-2022 Jeremy Ashkenas, Julian Gonggrijp, and DocumentCloud and
+    // Investigative Reporters & Editors
+    // Underscore may be freely distributed under the MIT license.
+    // --
+    // Returns a function, that, when invoked, will only be triggered at most once
+    // during a given window of time. Normally, the throttled function will run
+    // as much as it can, without ever going more than once per `wait` duration;
+    // but if you'd like to disable the execution on the leading edge, pass
+    // `{leading: false}`. To disable execution on the trailing edge, ditto.
+    var timeout, context, args, result;
+    var previous = 0;
+    if (!options) options = {};
+
+    var later = function() {
+      previous = options.leading === false ? 0 : Date.now();
+      timeout = null;
+      result = func.apply(context, args);
+      if (!timeout) context = args = null;
+    };
+
+    var throttled = function() {
+      var _now = Date.now();
+      if (!previous && options.leading === false) previous = _now;
+      var remaining = wait - (_now - previous);
+      context = this;
+      args = arguments;
+      if (remaining <= 0 || remaining > wait) {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+        previous = _now;
+        result = func.apply(context, args);
+        if (!timeout) context = args = null;
+      } else if (!timeout && options.trailing !== false) {
+        timeout = setTimeout(later, remaining);
+      }
+      return result;
+    };
+
+    throttled.cancel = function() {
+      clearTimeout(timeout);
+      previous = 0;
+      timeout = context = args = null;
+    };
+
+    return throttled;
+  }
+
+}
+
+export default Tetra;
